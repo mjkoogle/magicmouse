@@ -308,6 +308,32 @@
     ];
     const MIN_MIDI = 48, MAX_MIDI = 76;
 
+    /** Transpose notes to fit the practice keyboard: pick the octave shift that keeps
+     *  the most notes in range, then octave-fold any remaining out-of-range notes
+     *  (wrap by octave instead of clamping) so they still sound natural. */
+    function transposeNotesToKeyboard(notes) {
+      if (!notes.length) return notes;
+      let bestShift = 0;
+      let bestInRange = -1;
+      for (let shift = -48; shift <= 48; shift += 12) {
+        let inRange = 0;
+        for (const n of notes) {
+          const m = n.midi + shift;
+          if (m >= MIN_MIDI && m <= MAX_MIDI) inRange++;
+        }
+        if (inRange > bestInRange) {
+          bestInRange = inRange;
+          bestShift = shift;
+        }
+      }
+      return notes.map(n => {
+        let m = n.midi + bestShift;
+        while (m > MAX_MIDI) m -= 12;
+        while (m < MIN_MIDI) m += 12;
+        return { ...n, midi: m };
+      });
+    }
+
     // ═════════════════════════════════════════════════════════════
     // MAIN APP
     // ═════════════════════════════════════════════════════════════
@@ -823,15 +849,7 @@
         reader.onload = (ev) => {
           try {
             let notes = parseMidi(ev.target.result);
-            // Transpose to fit our keyboard range
-            if (notes.length) {
-              const minN = Math.min(...notes.map(n => n.midi));
-              const maxN = Math.max(...notes.map(n => n.midi));
-              const mid = (minN + maxN) / 2;
-              const targetMid = (MIN_MIDI + MAX_MIDI) / 2;
-              const shift = Math.round((targetMid - mid) / 12) * 12;
-              notes = notes.map(n => ({ ...n, midi: Math.max(MIN_MIDI, Math.min(MAX_MIDI, n.midi + shift)) }));
-            }
+            if (notes.length) notes = transposeNotesToKeyboard(notes);
             const name = file.name.replace(/\.mid[i]?$/i, "");
             setCustomSongs(p => ({ ...p, [name]: notes }));
             setSongName(name);
@@ -864,14 +882,7 @@
             setDownloadingId(null); return;
           }
           let notes = parseMidi(buf);
-          if (notes.length) {
-            const minN = Math.min(...notes.map(n => n.midi));
-            const maxN = Math.max(...notes.map(n => n.midi));
-            const mid = (minN + maxN) / 2;
-            const targetMid = (MIN_MIDI + MAX_MIDI) / 2;
-            const shift = Math.round((targetMid - mid) / 12) * 12;
-            notes = notes.map(n => ({ ...n, midi: Math.max(MIN_MIDI, Math.min(MAX_MIDI, n.midi + shift)) }));
-          }
+          if (notes.length) notes = transposeNotesToKeyboard(notes);
           const name = stripHtml(song.title);
           setCustomSongs(p => ({ ...p, [name]: notes }));
           setSongName(name);
