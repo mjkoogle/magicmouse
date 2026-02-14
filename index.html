@@ -129,6 +129,8 @@
       return notes.sort((a, b) => a.time - b.time);
     }
 
+    function stripHtml(str) { return str.replace(/<[^>]*>/g, "").trim(); }
+
     // ─── BMP Midi Repository Catalog (fallback) ─────────────────
     const BMP_BASE = "https://songs.bardmusicplayer.com/";
     const BMP_CATALOG = [
@@ -180,13 +182,13 @@
           const re = /<a[^>]*href="\?dl=(\d+)"[^>]*title="([^"]*)"[^>]*>([^<]*)<\/a>\s*<\/td>\s*<td[^>]*>([^<]*)/gi;
           let m;
           while ((m = re.exec(html)) !== null) {
-            songs.push({ id: m[1], title: m[2].trim() || m[3].trim(), author: m[4].trim() });
+            songs.push({ id: m[1], title: stripHtml(m[2] || m[3]), author: stripHtml(m[4]) });
           }
           // Fallback: simpler pattern
           if (songs.length === 0) {
             const re2 = /\?dl=(\d+)[^"]*"([^"]+)"/g;
             while ((m = re2.exec(html)) !== null) {
-              songs.push({ id: m[1], title: m[2].trim(), author: "" });
+              songs.push({ id: m[1], title: stripHtml(m[2]), author: "" });
             }
           }
           if (songs.length > 0) return songs;
@@ -748,6 +750,7 @@
       const [browserLoading, setBrowserLoading] = useState(false);
       const [downloadingId, setDownloadingId] = useState(null);
       const [catalogLoaded, setCatalogLoaded] = useState(false);
+      const [downloadError, setDownloadError] = useState(null); // {title, url} or null
 
       const canvasRef = useRef(null); const animRef = useRef(null);
       const synthRef = useRef(null); const playingRef = useRef(false);
@@ -857,7 +860,7 @@
         try {
           const buf = await downloadBMPMidi(song.id);
           if (!buf) {
-            alert("Couldn't download — try the Upload button with the file from:\n" + BMP_BASE + "?dl=" + song.id);
+            setDownloadError({ title: stripHtml(song.title), url: BMP_BASE + "?dl=" + song.id });
             setDownloadingId(null); return;
           }
           let notes = parseMidi(buf);
@@ -869,13 +872,13 @@
             const shift = Math.round((targetMid - mid) / 12) * 12;
             notes = notes.map(n => ({ ...n, midi: Math.max(MIN_MIDI, Math.min(MAX_MIDI, n.midi + shift)) }));
           }
-          const name = song.title;
+          const name = stripHtml(song.title);
           setCustomSongs(p => ({ ...p, [name]: notes }));
           setSongName(name);
           setShowBrowser(false);
           if (playing) stopPlaying();
         } catch (err) {
-          alert("Error parsing MIDI: " + err.message);
+          setDownloadError({ title: stripHtml(song.title), url: BMP_BASE + "?dl=" + song.id, error: err.message });
         }
         setDownloadingId(null);
       };
@@ -1256,6 +1259,59 @@
               </div>
             </div>
           </div>
+
+          {/* Download Error Modal */}
+          {downloadError && (
+            <div style={{
+              position: "fixed", inset: 0, background: "rgba(0,0,0,0.8)", zIndex: 200,
+              display: "flex", alignItems: "center", justifyContent: "center", padding: 16
+            }}
+              onClick={() => setDownloadError(null)}>
+              <div style={{
+                background: "#12141a", border: "1px solid rgba(255,107,107,0.25)", borderRadius: 10,
+                width: "100%", maxWidth: 420, padding: 24, fontFamily: "'IBM Plex Mono',monospace", textAlign: "center"
+              }} onClick={e => e.stopPropagation()}>
+                <div style={{ fontSize: 24, marginBottom: 10 }}>⚠️</div>
+                <div style={{ fontSize: 13, fontWeight: 600, color: "#ff6b6b", marginBottom: 8 }}>
+                  {downloadError.error ? "Error Parsing MIDI" : "Download Failed"}
+                </div>
+                <div style={{ fontSize: 11, color: "rgba(255,255,255,0.6)", marginBottom: 6, lineHeight: 1.6 }}>
+                  {downloadError.error
+                    ? `Couldn't parse "${downloadError.title}": ${downloadError.error}`
+                    : `Couldn't download "${downloadError.title}" due to CORS restrictions.`}
+                </div>
+                <div style={{ fontSize: 10, color: "rgba(255,255,255,0.4)", marginBottom: 12, lineHeight: 1.6 }}>
+                  Download the file manually, then use the <b>Upload</b> button:
+                </div>
+                <a
+                  href={downloadError.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={{
+                    display: "inline-block", padding: "8px 16px", background: "rgba(100,255,218,0.08)",
+                    border: "1px solid rgba(100,255,218,0.3)", borderRadius: 5, color: "#64ffda",
+                    fontSize: 11, fontFamily: "'IBM Plex Mono',monospace", textDecoration: "none",
+                    wordBreak: "break-all", lineHeight: 1.5, cursor: "pointer", transition: "all .12s",
+                    maxWidth: "100%"
+                  }}
+                  onMouseEnter={e => { e.target.style.background = "rgba(100,255,218,0.15)"; }}
+                  onMouseLeave={e => { e.target.style.background = "rgba(100,255,218,0.08)"; }}
+                >
+                  {downloadError.url}
+                </a>
+                <div style={{ marginTop: 16 }}>
+                  <button onClick={() => setDownloadError(null)}
+                    style={{
+                      background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.15)",
+                      borderRadius: 5, padding: "6px 24px", color: "rgba(255,255,255,0.5)", fontSize: 11,
+                      fontFamily: "'IBM Plex Mono',monospace", cursor: "pointer"
+                    }}>
+                    Close
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* BMP Browser Modal */}
           {showBrowser && (
