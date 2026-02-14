@@ -1,0 +1,1095 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>Music Mouse Future — An Intelligent Instrument</title>
+  <meta name="description" content="A modern recreation of Laurie Spiegel's Music Mouse (1986) with multitouch, loop recording, QWERTY piano, and AI harmony." />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎵</text></svg>" />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #root { width: 100%; height: 100%; overflow: hidden; background: #08080a; }
+    input::placeholder { color: rgba(255,255,255,0.25); }
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgba(100,255,218,0.2); border-radius: 2px; }
+  </style>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+  <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect, useRef, useCallback } = React;
+
+    // ─── Music Theory ───────────────────────────────────────────
+    const SCALES = {
+      Major: [0, 2, 4, 5, 7, 9, 11],
+      Minor: [0, 2, 3, 5, 7, 8, 10],
+      Dorian: [0, 2, 3, 5, 7, 9, 10],
+      Pentatonic: [0, 2, 4, 7, 9],
+      Blues: [0, 3, 5, 6, 7, 10],
+      Chromatic: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+      "Whole Tone": [0, 2, 4, 6, 8, 10],
+      Phrygian: [0, 1, 3, 5, 7, 8, 10],
+      Lydian: [0, 2, 4, 6, 7, 9, 11],
+    };
+
+    const HARMONY_MODES = {
+      Thirds: { v3: 2, v4: 2 },
+      Fifths: { v3: 4, v4: 4 },
+      Octaves: { v3: 7, v4: 7 },
+      Mixed: { v3: 2, v4: 4 },
+      Contrary: { v3: -2, v4: -4 },
+    };
+
+    const WAVEFORMS = ["triangle", "sine", "square", "sawtooth", "fatsawtooth", "fmsine"];
+
+    const TOUCH_COLORS = [
+      { r: 100, g: 255, b: 218 },
+      { r: 255, g: 107, b: 107 },
+      { r: 167, g: 139, b: 250 },
+      { r: 255, g: 213, b: 79 },
+    ];
+
+    function quantizeToScale(midiNote, scale, root = 48) {
+      const n = ((midiNote - root) % 12 + 12) % 12;
+      const oct = Math.floor((midiNote - root) / 12);
+      let best = scale[0], bestD = 99;
+      for (const s of scale) {
+        const d = Math.min(Math.abs(n - s), 12 - Math.abs(n - s));
+        if (d < bestD) { bestD = d; best = s; }
+      }
+      return root + oct * 12 + best;
+    }
+
+    function midiToFreq(m) { return 440 * Math.pow(2, (m - 69) / 12); }
+    function midiToName(m) {
+      const names = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"];
+      return names[m % 12] + (Math.floor(m / 12) - 1);
+    }
+
+    function getHarmNote(idx, off, scale) {
+      const ni = idx + off;
+      const sl = scale.length;
+      return scale[((ni % sl) + sl) % sl] + Math.floor(ni / sl) * 12;
+    }
+
+    // ─── Particle System ────────────────────────────────────────
+    class Particle {
+      constructor(x, y, color) {
+        this.x = x; this.y = y;
+        this.vx = (Math.random() - 0.5) * 2;
+        this.vy = (Math.random() - 0.5) * 2;
+        this.life = 1;
+        this.decay = 0.008 + Math.random() * 0.015;
+        this.size = 1.5 + Math.random() * 3;
+        this.color = color;
+      }
+      update() {
+        this.x += this.vx; this.y += this.vy;
+        this.vx *= 0.98; this.vy *= 0.98;
+        this.life -= this.decay;
+      }
+      draw(ctx) {
+        if (this.life <= 0) return;
+        const { r, g, b } = this.color;
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, this.size * this.life, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(${r},${g},${b},${this.life * 0.6})`;
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, this.size * this.life * 2, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(${r},${g},${b},${this.life * 0.15})`;
+        ctx.fill();
+      }
+    }
+
+    // ─── Main Component ─────────────────────────────────────────
+    function MusicMouseFuture() {
+      const [isStarted, setIsStarted] = useState(false);
+      const [scaleName, setScaleName] = useState("Major");
+      const [harmonyMode, setHarmonyMode] = useState("Mixed");
+      const [waveIndex, setWaveIndex] = useState(0);
+      const [octaveOffset, setOctaveOffset] = useState(0);
+      const [volume, setVolume] = useState(-12);
+      const [voices, setVoices] = useState([]);
+      const [loops, setLoops] = useState([]);
+      const [isRecording, setIsRecording] = useState(false);
+      const [aiPrompt, setAiPrompt] = useState("");
+      const [aiLoading, setAiLoading] = useState(false);
+      const [aiStatus, setAiStatus] = useState("");
+      const [activeTouches, setActiveTouches] = useState({});
+      const [showHelp, setShowHelp] = useState(false);
+      const [apiKey, setApiKey] = useState("");
+      const [showApiKey, setShowApiKey] = useState(false);
+
+      const gridRef = useRef(null);
+      const canvasRef = useRef(null);
+      const synthsRef = useRef({});
+      const reverbRef = useRef(null);
+      const analyserRef = useRef(null);
+      const particlesRef = useRef([]);
+      const animFrameRef = useRef(null);
+      const touchStateRef = useRef({});
+      const lastNotesRef = useRef({});
+      const scaleRef = useRef(SCALES.Major);
+      const harmRef = useRef(HARMONY_MODES.Mixed);
+      const octRef = useRef(0);
+      const recRef = useRef(null);
+      const loopsRef = useRef([]);
+      const loopTimersRef = useRef([]);
+
+      useEffect(() => { scaleRef.current = SCALES[scaleName]; }, [scaleName]);
+      useEffect(() => { harmRef.current = HARMONY_MODES[harmonyMode]; }, [harmonyMode]);
+      useEffect(() => { octRef.current = octaveOffset; }, [octaveOffset]);
+
+      // ─── Audio Init ───────────────────────────────────────────
+      const initAudio = useCallback(async () => {
+        await Tone.start();
+        const reverb = new Tone.Reverb({ decay: 4, wet: 0.3 }).toDestination();
+        await reverb.generate();
+        reverbRef.current = reverb;
+
+        const analyser = new Tone.Analyser("waveform", 128);
+        analyser.connect(Tone.getDestination());
+        analyserRef.current = analyser;
+
+        setIsStarted(true);
+      }, []);
+
+      const getOrCreateSynth = useCallback((id) => {
+        if (synthsRef.current[id]) return synthsRef.current[id];
+        const synth = new Tone.PolySynth(Tone.Synth, {
+          maxPolyphony: 6,
+          options: {
+            oscillator: { type: WAVEFORMS[waveIndex] },
+            envelope: { attack: 0.06, decay: 0.25, sustain: 0.4, release: 1.0 },
+            volume: volume,
+          },
+        }).connect(reverbRef.current);
+        synthsRef.current[id] = synth;
+        return synth;
+      }, [waveIndex, volume]);
+
+      // ─── Voice Computation ────────────────────────────────────
+      const computeVoices = useCallback((mx, my) => {
+        const scale = scaleRef.current;
+        const harmony = harmRef.current;
+        const base = 48 + octRef.current * 12;
+        const range = 24;
+        const raw1 = base + Math.round(mx * range);
+        const raw2 = base + Math.round((1 - my) * range);
+        const m1 = quantizeToScale(raw1, scale, base);
+        const m2 = quantizeToScale(raw2, scale, base);
+        const i1 = Math.max(0, scale.indexOf(((m1 - base) % 12 + 12) % 12));
+        const i2 = Math.max(0, scale.indexOf(((m2 - base) % 12 + 12) % 12));
+        const h3 = getHarmNote(i1, harmony.v3, scale);
+        const h4 = getHarmNote(i2, harmony.v4, scale);
+        const m3 = quantizeToScale(base + h3, scale, base);
+        const m4 = quantizeToScale(base + h4, scale, base);
+        return [m1, m2, m3, m4];
+      }, []);
+
+      const playNotesForTouch = useCallback((id, midiNotes) => {
+        const synth = getOrCreateSynth(id);
+        const prev = lastNotesRef.current[id] || [];
+        const changed = midiNotes.some((n, i) => n !== prev[i]);
+        if (!changed) return;
+        if (prev.length) {
+          try { synth.triggerRelease(prev.map(midiToFreq), Tone.now()); } catch(e) {}
+        }
+        synth.triggerAttack(midiNotes.map(midiToFreq), Tone.now(), 0.45);
+        lastNotesRef.current[id] = [...midiNotes];
+      }, [getOrCreateSynth]);
+
+      const releaseTouch = useCallback((id) => {
+        const synth = synthsRef.current[id];
+        if (synth) {
+          try { synth.releaseAll(Tone.now()); } catch(e) {}
+        }
+        delete lastNotesRef.current[id];
+      }, []);
+
+      // ─── Waveform update for all synths ───────────────────────
+      useEffect(() => {
+        Object.values(synthsRef.current).forEach(s => {
+          try { s.set({ oscillator: { type: WAVEFORMS[waveIndex] } }); } catch(e) {}
+        });
+      }, [waveIndex]);
+
+      useEffect(() => {
+        Object.values(synthsRef.current).forEach(s => {
+          try { s.set({ volume }); } catch(e) {}
+        });
+      }, [volume]);
+
+      // ─── Recording ────────────────────────────────────────────
+      const startRecording = useCallback(() => {
+        recRef.current = { startTime: Date.now(), events: [] };
+        setIsRecording(true);
+      }, []);
+
+      const stopRecording = useCallback(() => {
+        if (!recRef.current || recRef.current.events.length < 2) {
+          setIsRecording(false);
+          recRef.current = null;
+          return;
+        }
+        const loop = {
+          id: Date.now(),
+          events: recRef.current.events,
+          duration: Date.now() - recRef.current.startTime,
+          color: TOUCH_COLORS[loops.length % TOUCH_COLORS.length],
+        };
+        setLoops(prev => [...prev, loop]);
+        loopsRef.current = [...loopsRef.current, loop];
+        setIsRecording(false);
+        recRef.current = null;
+        startLoopPlayback(loop);
+      }, [loops.length]);
+
+      const startLoopPlayback = useCallback((loop) => {
+        const synthId = `loop_${loop.id}`;
+        const playLoop = () => {
+          let i = 0;
+          const step = () => {
+            if (i >= loop.events.length) {
+              releaseTouch(synthId);
+              setTimeout(playLoop, 50);
+              return;
+            }
+            const ev = loop.events[i];
+            const notes = computeVoices(ev.x, ev.y);
+            playNotesForTouch(synthId, notes);
+            const cx = canvasRef.current?.width * ev.x;
+            const cy = canvasRef.current?.height * ev.y;
+            if (cx && cy) {
+              for (let p = 0; p < 2; p++) {
+                particlesRef.current.push(new Particle(cx, cy, loop.color));
+              }
+            }
+            i++;
+            const nextDelay = i < loop.events.length
+              ? loop.events[i].t - ev.t
+              : loop.duration - ev.t;
+            const timer = setTimeout(step, Math.max(nextDelay, 16));
+            loopTimersRef.current.push(timer);
+          };
+          step();
+        };
+        playLoop();
+      }, [computeVoices, playNotesForTouch, releaseTouch]);
+
+      const clearLoops = useCallback(() => {
+        loopTimersRef.current.forEach(clearTimeout);
+        loopTimersRef.current = [];
+        loopsRef.current.forEach(l => releaseTouch(`loop_${l.id}`));
+        loopsRef.current = [];
+        setLoops([]);
+      }, [releaseTouch]);
+
+      // ─── Pointer Handlers (unified mouse + touch) ─────────────
+      const getPos = (clientX, clientY) => {
+        if (!gridRef.current) return null;
+        const r = gridRef.current.getBoundingClientRect();
+        return {
+          x: Math.max(0, Math.min(1, (clientX - r.left) / r.width)),
+          y: Math.max(0, Math.min(1, (clientY - r.top) / r.height)),
+        };
+      };
+
+      const handlePointerDown = useCallback((e) => {
+        if (!isStarted) return;
+        e.preventDefault();
+        const pos = getPos(e.clientX, e.clientY);
+        if (!pos) return;
+        const id = e.pointerId;
+        gridRef.current?.setPointerCapture(id);
+        const colorIdx = Object.keys(touchStateRef.current).length % TOUCH_COLORS.length;
+        touchStateRef.current[id] = { ...pos, color: TOUCH_COLORS[colorIdx] };
+        const notes = computeVoices(pos.x, pos.y);
+        playNotesForTouch(`ptr_${id}`, notes);
+        if (recRef.current) {
+          recRef.current.events.push({ x: pos.x, y: pos.y, t: Date.now() - recRef.current.startTime });
+        }
+        updateActiveTouches();
+      }, [isStarted, computeVoices, playNotesForTouch]);
+
+      const handlePointerMove = useCallback((e) => {
+        if (!touchStateRef.current[e.pointerId]) return;
+        e.preventDefault();
+        const pos = getPos(e.clientX, e.clientY);
+        if (!pos) return;
+        const tc = touchStateRef.current[e.pointerId];
+        tc.x = pos.x; tc.y = pos.y;
+        const notes = computeVoices(pos.x, pos.y);
+        playNotesForTouch(`ptr_${e.pointerId}`, notes);
+        if (recRef.current) {
+          recRef.current.events.push({ x: pos.x, y: pos.y, t: Date.now() - recRef.current.startTime });
+        }
+        const cx = canvasRef.current?.width * pos.x;
+        const cy = canvasRef.current?.height * pos.y;
+        if (cx && cy) {
+          for (let i = 0; i < 3; i++) {
+            particlesRef.current.push(new Particle(cx, cy, tc.color));
+          }
+        }
+        updateActiveTouches();
+      }, [computeVoices, playNotesForTouch]);
+
+      const handlePointerUp = useCallback((e) => {
+        releaseTouch(`ptr_${e.pointerId}`);
+        delete touchStateRef.current[e.pointerId];
+        updateActiveTouches();
+      }, [releaseTouch]);
+
+      const updateActiveTouches = () => {
+        const snp = {};
+        Object.entries(touchStateRef.current).forEach(([id, t]) => { snp[id] = { ...t }; });
+        setActiveTouches(snp);
+        const allVoices = [];
+        Object.values(touchStateRef.current).forEach(t => {
+          const n = computeVoices(t.x, t.y);
+          allVoices.push(...n.map(midiToName));
+        });
+        setVoices(allVoices.length ? allVoices : []);
+      };
+
+      // ─── Canvas Animation ─────────────────────────────────────
+      useEffect(() => {
+        if (!isStarted) return;
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const ctx = canvas.getContext("2d");
+
+        const resize = () => {
+          const parent = canvas.parentElement;
+          if (!parent) return;
+          canvas.width = parent.clientWidth;
+          canvas.height = parent.clientHeight;
+        };
+        resize();
+        window.addEventListener("resize", resize);
+
+        const draw = () => {
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+          // Draw grid
+          const gx = 16, gy = 12;
+          ctx.strokeStyle = "rgba(100,255,218,0.06)";
+          ctx.lineWidth = 0.5;
+          for (let i = 0; i <= gx; i++) {
+            const x = (i / gx) * canvas.width;
+            ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke();
+          }
+          for (let i = 0; i <= gy; i++) {
+            const y = (i / gy) * canvas.height;
+            ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
+          }
+
+          // Draw waveform along bottom
+          if (analyserRef.current) {
+            const waveform = analyserRef.current.getValue();
+            ctx.beginPath();
+            ctx.strokeStyle = "rgba(100,255,218,0.2)";
+            ctx.lineWidth = 1.5;
+            const h = canvas.height;
+            const sliceW = canvas.width / waveform.length;
+            for (let i = 0; i < waveform.length; i++) {
+              const v = waveform[i];
+              const y = h - 30 + v * 25;
+              if (i === 0) ctx.moveTo(0, y);
+              else ctx.lineTo(i * sliceW, y);
+            }
+            ctx.stroke();
+          }
+
+          // Update & draw particles
+          particlesRef.current = particlesRef.current.filter(p => p.life > 0);
+          particlesRef.current.forEach(p => { p.update(); p.draw(ctx); });
+
+          // Draw active touch cursors
+          Object.values(touchStateRef.current).forEach(t => {
+            const cx = t.x * canvas.width;
+            const cy = t.y * canvas.height;
+            const { r, g, b } = t.color;
+
+            ctx.strokeStyle = `rgba(${r},${g},${b},0.25)`;
+            ctx.lineWidth = 0.5;
+            ctx.setLineDash([4, 4]);
+            ctx.beginPath(); ctx.moveTo(cx, 0); ctx.lineTo(cx, canvas.height); ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(0, cy); ctx.lineTo(canvas.width, cy); ctx.stroke();
+            ctx.setLineDash([]);
+
+            const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, 40);
+            grad.addColorStop(0, `rgba(${r},${g},${b},0.3)`);
+            grad.addColorStop(1, `rgba(${r},${g},${b},0)`);
+            ctx.fillStyle = grad;
+            ctx.beginPath(); ctx.arc(cx, cy, 40, 0, Math.PI * 2); ctx.fill();
+
+            ctx.fillStyle = `rgba(${r},${g},${b},0.9)`;
+            ctx.beginPath(); ctx.arc(cx, cy, 4, 0, Math.PI * 2); ctx.fill();
+
+            const pulse = (Date.now() % 1500) / 1500;
+            ctx.strokeStyle = `rgba(${r},${g},${b},${0.4 * (1 - pulse)})`;
+            ctx.lineWidth = 1;
+            ctx.beginPath(); ctx.arc(cx, cy, 8 + pulse * 30, 0, Math.PI * 2); ctx.stroke();
+          });
+
+          // Recording indicator
+          if (recRef.current) {
+            const blink = Math.sin(Date.now() / 200) > 0;
+            if (blink) {
+              ctx.fillStyle = "rgba(255,60,60,0.8)";
+              ctx.beginPath(); ctx.arc(20, 20, 6, 0, Math.PI * 2); ctx.fill();
+            }
+            ctx.fillStyle = "rgba(255,255,255,0.4)";
+            ctx.font = "10px 'IBM Plex Mono', monospace";
+            ctx.fillText("REC", 32, 24);
+          }
+
+          animFrameRef.current = requestAnimationFrame(draw);
+        };
+        animFrameRef.current = requestAnimationFrame(draw);
+
+        return () => {
+          cancelAnimationFrame(animFrameRef.current);
+          window.removeEventListener("resize", resize);
+        };
+      }, [isStarted]);
+
+      // ─── QWERTY Piano Keyboard ─────────────────────────────────
+      const PIANO_MAP = {
+        "z": 48, "s": 49, "x": 50, "d": 51, "c": 52, "v": 53,
+        "g": 54, "b": 55, "h": 56, "n": 57, "j": 58, "m": 59,
+        ",": 60,
+        "q": 60, "2": 61, "w": 62, "3": 63, "e": 64, "r": 65,
+        "5": 66, "t": 67, "6": 68, "y": 69, "7": 70, "u": 71,
+        "i": 72, "9": 73, "o": 74, "0": 75, "p": 76,
+      };
+
+      const [pianoMode, setPianoMode] = useState(false);
+      const [activeKeys, setActiveKeys] = useState(new Set());
+      const pianoModeRef = useRef(false);
+      const heldKeysRef = useRef(new Set());
+      const pianoSynthRef = useRef(null);
+
+      useEffect(() => { pianoModeRef.current = pianoMode; }, [pianoMode]);
+
+      const getPianoSynth = useCallback(() => {
+        if (pianoSynthRef.current) return pianoSynthRef.current;
+        if (!reverbRef.current) return null;
+        const s = new Tone.PolySynth(Tone.Synth, {
+          maxPolyphony: 12,
+          options: {
+            oscillator: { type: WAVEFORMS[waveIndex] },
+            envelope: { attack: 0.04, decay: 0.2, sustain: 0.5, release: 0.8 },
+            volume: volume,
+          },
+        }).connect(reverbRef.current);
+        pianoSynthRef.current = s;
+        return s;
+      }, [waveIndex, volume]);
+
+      useEffect(() => {
+        if (pianoSynthRef.current) {
+          try { pianoSynthRef.current.set({ oscillator: { type: WAVEFORMS[waveIndex] } }); } catch(e) {}
+        }
+      }, [waveIndex]);
+
+      useEffect(() => {
+        if (pianoSynthRef.current) {
+          try { pianoSynthRef.current.set({ volume }); } catch(e) {}
+        }
+      }, [volume]);
+
+      // ─── Keyboard Controls ────────────────────────────────────
+      useEffect(() => {
+        const isInput = () => {
+          const el = document.activeElement;
+          return el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.contentEditable === "true");
+        };
+
+        const handleDown = (e) => {
+          if (isInput()) return;
+          const k = e.key.toLowerCase();
+
+          if (pianoModeRef.current) {
+            const midi = PIANO_MAP[k];
+            if (midi !== undefined && !heldKeysRef.current.has(k)) {
+              e.preventDefault();
+              heldKeysRef.current.add(k);
+              setActiveKeys(new Set(heldKeysRef.current));
+              const synth = getPianoSynth();
+              if (synth) {
+                const scale = scaleRef.current;
+                const base = 48 + octRef.current * 12;
+                const quantized = quantizeToScale(midi + octRef.current * 12, scale, base);
+                const freq = midiToFreq(quantized);
+                synth.triggerAttack(freq, Tone.now(), 0.6);
+                if (canvasRef.current) {
+                  const cx = canvasRef.current.width * ((quantized - base) / 24);
+                  const cy = canvasRef.current.height * 0.5;
+                  for (let i = 0; i < 4; i++) {
+                    particlesRef.current.push(new Particle(
+                      Math.max(0, Math.min(canvasRef.current.width, cx)),
+                      cy + (Math.random() - 0.5) * 100,
+                      { r: 167, g: 139, b: 250 }
+                    ));
+                  }
+                }
+              }
+              return;
+            }
+            if (k === "escape") { setPianoMode(false); return; }
+            return;
+          }
+
+          if (k === " ") {
+            e.preventDefault();
+            if (recRef.current) stopRecording();
+            else startRecording();
+          }
+          else if (k === "`" || k === "~") setPianoMode(true);
+        };
+
+        const handleUp = (e) => {
+          const k = e.key.toLowerCase();
+          if (pianoModeRef.current && PIANO_MAP[k] !== undefined) {
+            heldKeysRef.current.delete(k);
+            setActiveKeys(new Set(heldKeysRef.current));
+            const midi = PIANO_MAP[k];
+            const synth = pianoSynthRef.current;
+            if (synth) {
+              const scale = scaleRef.current;
+              const base = 48 + octRef.current * 12;
+              const quantized = quantizeToScale(midi + octRef.current * 12, scale, base);
+              const freq = midiToFreq(quantized);
+              try { synth.triggerRelease(freq, Tone.now()); } catch(e) {}
+            }
+          }
+        };
+
+        window.addEventListener("keydown", handleDown);
+        window.addEventListener("keyup", handleUp);
+        return () => {
+          window.removeEventListener("keydown", handleDown);
+          window.removeEventListener("keyup", handleUp);
+        };
+      }, [startRecording, stopRecording, getPianoSynth]);
+
+      // ─── AI Harmony ───────────────────────────────────────────
+      const askAI = async () => {
+        if (!aiPrompt.trim() || aiLoading) return;
+        if (!apiKey.trim()) {
+          setAiStatus("Enter an Anthropic API key first (click the key icon)");
+          setShowApiKey(true);
+          return;
+        }
+        setAiLoading(true);
+        setAiStatus("Thinking...");
+        try {
+          const resp = await fetch("https://api.anthropic.com/v1/messages", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-api-key": apiKey.trim(),
+              "anthropic-version": "2023-06-01",
+              "anthropic-dangerous-direct-browser-access": "true",
+            },
+            body: JSON.stringify({
+              model: "claude-sonnet-4-20250514",
+              max_tokens: 1000,
+              messages: [{
+                role: "user",
+                content: `You are a music theory AI. Based on this mood/description, suggest musical parameters. Respond ONLY with valid JSON, no markdown, no explanation.
+
+Mood: "${aiPrompt}"
+
+Return JSON with these exact fields:
+{
+  "scale": one of ${JSON.stringify(Object.keys(SCALES))},
+  "harmony": one of ${JSON.stringify(Object.keys(HARMONY_MODES))},
+  "waveform_index": 0-5 (0=triangle,1=sine,2=square,3=sawtooth,4=fatsawtooth,5=fmsine),
+  "octave_offset": -2 to 2,
+  "explanation": brief 1-sentence explanation of your choices
+}`
+              }],
+            }),
+          });
+          const data = await resp.json();
+          if (data.error) throw new Error(data.error.message || "API error");
+          const text = data.content?.map(b => b.text || "").join("") || "";
+          const clean = text.replace(/```json|```/g, "").trim();
+          const parsed = JSON.parse(clean);
+
+          if (parsed.scale && SCALES[parsed.scale]) setScaleName(parsed.scale);
+          if (parsed.harmony && HARMONY_MODES[parsed.harmony]) setHarmonyMode(parsed.harmony);
+          if (typeof parsed.waveform_index === "number") {
+            const wi = Math.max(0, Math.min(WAVEFORMS.length - 1, parsed.waveform_index));
+            setWaveIndex(wi);
+            Object.values(synthsRef.current).forEach(s => {
+              try { s.set({ oscillator: { type: WAVEFORMS[wi] } }); } catch(e) {}
+            });
+          }
+          if (typeof parsed.octave_offset === "number") {
+            setOctaveOffset(Math.max(-2, Math.min(2, parsed.octave_offset)));
+          }
+          setAiStatus(parsed.explanation || "Applied!");
+        } catch (err) {
+          setAiStatus("Error: " + err.message);
+        }
+        setAiLoading(false);
+      };
+
+      // ─── Render ───────────────────────────────────────────────
+      const touchCount = Object.keys(activeTouches).length;
+
+      return (
+        <div style={S.container}>
+          {/* Header */}
+          <div style={S.header}>
+            <div style={S.titleRow}>
+              <h1 style={S.title}>MUSIC MOUSE</h1>
+              <span style={S.badge}>FUTURE</span>
+              <span style={S.subtitle}>An Intelligent Instrument</span>
+            </div>
+            <div style={S.headerRight}>
+              <button onClick={() => setShowHelp(h => !h)} style={S.helpBtn}>?</button>
+              <span style={S.credit}>After Laurie Spiegel, 1986</span>
+            </div>
+          </div>
+
+          {showHelp && (
+            <div style={S.helpOverlay} onClick={() => setShowHelp(false)}>
+              <div style={S.helpBox} onClick={e => e.stopPropagation()}>
+                <div style={S.helpTitle}>HOW TO PLAY</div>
+                <div style={S.helpText}>
+                  <b>Click/touch &amp; drag</b> on the grid to perform. Each finger creates its own voice pair.
+                  X-axis = Voice 1 pitch, Y-axis = Voice 2 pitch. Two harmony voices are computed algorithmically.
+                </div>
+                <div style={S.helpTitle}>KEYBOARD</div>
+                <div style={S.helpText}>
+                  <b>Space</b> Record/Stop loop &nbsp; <b>` (backtick)</b> Toggle piano mode<br/>
+                  In piano mode: bottom row (Z-M) = lower octave, top row (Q-P) = upper octave. Black keys on S/D/G/H/J and 2/3/5/6/7. Notes quantize to the active scale. <b>Esc</b> exits piano mode.
+                </div>
+                <div style={S.helpTitle}>AI HARMONY</div>
+                <div style={S.helpText}>
+                  Requires an Anthropic API key. Type a mood (e.g. "eerie underwater cave") and Claude will pick the best scale, harmony, waveform, and octave to match.
+                </div>
+                <button onClick={() => setShowHelp(false)} style={{...S.chip, ...S.chipActive, marginTop: 12}}>Got it</button>
+              </div>
+            </div>
+          )}
+
+          {!isStarted ? (
+            <div style={S.startOverlay} onClick={initAudio}>
+              <div style={S.startContent}>
+                <div style={S.startIcon}>◉</div>
+                <div style={S.startText}>Initialize Audio Engine</div>
+                <div style={S.startHint}>Multitouch · Loop Recording · QWERTY Piano · AI Harmony</div>
+              </div>
+            </div>
+          ) : (
+            <div style={S.mainLayout}>
+              {/* Performance Grid */}
+              <div style={S.gridWrapper}>
+                <div
+                  ref={gridRef}
+                  style={S.grid}
+                  onPointerDown={handlePointerDown}
+                  onPointerMove={handlePointerMove}
+                  onPointerUp={handlePointerUp}
+                  onPointerCancel={handlePointerUp}
+                >
+                  <canvas ref={canvasRef} style={S.canvas} />
+                  {touchCount === 0 && (
+                    <div style={S.gridHint}>
+                      {pianoMode
+                        ? "🎹 Piano mode active — type to play!"
+                        : loops.length > 0
+                          ? `${loops.length} loop${loops.length > 1 ? 's' : ''} playing · Touch to add`
+                          : "Touch or click to play"}
+                    </div>
+                  )}
+                  <div style={S.axLabelX}>← PITCH →</div>
+                  <div style={S.axLabelY}>← PITCH →</div>
+                </div>
+              </div>
+
+              {/* Controls */}
+              <div style={S.controls}>
+                {/* Voice Display */}
+                {voices.length > 0 && (
+                  <div style={S.voiceRow}>
+                    {voices.slice(0, 8).map((v, i) => (
+                      <span key={i} style={{
+                        ...S.voiceTag,
+                        borderColor: `rgba(${TOUCH_COLORS[Math.floor(i/4) % TOUCH_COLORS.length].r},${TOUCH_COLORS[Math.floor(i/4) % TOUCH_COLORS.length].g},${TOUCH_COLORS[Math.floor(i/4) % TOUCH_COLORS.length].b},0.5)`,
+                      }}>{v}</span>
+                    ))}
+                  </div>
+                )}
+
+                {/* Scale */}
+                <div style={S.row}>
+                  <span style={S.label}>SCALE</span>
+                  <div style={S.chipRow}>
+                    {Object.keys(SCALES).map((s) => (
+                      <button key={s} onClick={() => setScaleName(s)}
+                        style={{...S.chip, ...(scaleName === s ? S.chipActive : {})}}>
+                        {s}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Harmony + Wave */}
+                <div style={S.splitRow}>
+                  <div style={S.halfCol}>
+                    <span style={S.label}>HARMONY</span>
+                    <div style={S.chipRow}>
+                      {Object.keys(HARMONY_MODES).map(h => (
+                        <button key={h} onClick={() => setHarmonyMode(h)}
+                          style={{...S.chip, ...(harmonyMode === h ? S.chipActive : {})}}>
+                          {h}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div style={S.halfCol}>
+                    <span style={S.label}>WAVE</span>
+                    <div style={S.chipRow}>
+                      {WAVEFORMS.map((w, i) => (
+                        <button key={w} onClick={() => {
+                          setWaveIndex(i);
+                          Object.values(synthsRef.current).forEach(s => {
+                            try { s.set({ oscillator: { type: w } }); } catch(e) {}
+                          });
+                        }} style={{...S.chip, ...(waveIndex === i ? S.chipActive : {})}}>
+                          {w.length > 6 ? w.slice(0,4) : w.slice(0,3)}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                {/* Octave + Volume */}
+                <div style={S.splitRow}>
+                  <div style={S.halfCol}>
+                    <span style={S.label}>OCTAVE</span>
+                    <div style={S.chipRow}>
+                      {[-2,-1,0,1,2].map(o => (
+                        <button key={o} onClick={() => setOctaveOffset(o)}
+                          style={{...S.chip, ...(octaveOffset === o ? S.chipActive : {})}}>
+                          {o > 0 ? `+${o}` : o}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div style={S.halfCol}>
+                    <span style={S.label}>VOL {volume}dB</span>
+                    <div style={S.chipRow}>
+                      <button onClick={() => setVolume(v => Math.max(v-3,-30))} style={S.chip}>−</button>
+                      <div style={S.meterOuter}>
+                        <div style={{...S.meterInner, width: `${((volume+30)/30)*100}%`}} />
+                      </div>
+                      <button onClick={() => setVolume(v => Math.min(v+3,0))} style={S.chip}>+</button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Loops + Piano */}
+                <div style={S.splitRow}>
+                  <div style={S.halfCol}>
+                    <span style={S.label}>LOOPS</span>
+                    <div style={S.chipRow}>
+                      <button
+                        onClick={isRecording ? stopRecording : startRecording}
+                        style={{...S.chip, ...(isRecording ? S.chipRec : {})}}>
+                        {isRecording ? "⏹ Stop" : "⏺ Rec"} <span style={S.chipKey}>[Space]</span>
+                      </button>
+                      {loops.length > 0 && (
+                        <button onClick={clearLoops} style={S.chip}>✕ Clear ({loops.length})</button>
+                      )}
+                      {loops.map((l, i) => (
+                        <span key={l.id} style={{
+                          ...S.loopDot,
+                          background: `rgba(${l.color.r},${l.color.g},${l.color.b},0.5)`,
+                        }}>L{i+1}</span>
+                      ))}
+                    </div>
+                  </div>
+                  <div style={S.halfCol}>
+                    <span style={S.label}>KEYBOARD</span>
+                    <div style={S.chipRow}>
+                      <button
+                        onClick={() => setPianoMode(p => !p)}
+                        style={{...S.chip, ...(pianoMode ? S.chipPiano : {}), width: "100%"}}>
+                        {pianoMode ? "🎹 PIANO ON  [Esc to exit]" : "🎹 Piano Mode  [`]"}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Piano keyboard visual */}
+                {pianoMode && (
+                  <div style={S.pianoSection}>
+                    <span style={S.label}>PLAYING — notes quantized to {scaleName} scale</span>
+                    <div style={S.pianoRows}>
+                      <div style={S.pianoRow}>
+                        <span style={S.pianoRowLabel}>Upper</span>
+                        {["Q","2","W","3","E","R","5","T","6","Y","7","U","I","9","O","0","P"].map(k => {
+                          const isBlack = ["2","3","5","6","7","9","0"].includes(k);
+                          const isActive = activeKeys.has(k.toLowerCase());
+                          return (
+                            <div key={`u${k}`} style={{
+                              ...S.pianoKey,
+                              ...(isBlack ? S.pianoBlack : S.pianoWhite),
+                              ...(isActive ? S.pianoKeyActive : {}),
+                            }}>
+                              <span style={S.pianoKeyLabel}>{k}</span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                      <div style={S.pianoRow}>
+                        <span style={S.pianoRowLabel}>Lower</span>
+                        {["Z","S","X","D","C","V","G","B","H","N","J","M",","].map(k => {
+                          const isBlack = ["S","D","G","H","J"].includes(k);
+                          const isActive = activeKeys.has(k.toLowerCase());
+                          return (
+                            <div key={`l${k}`} style={{
+                              ...S.pianoKey,
+                              ...(isBlack ? S.pianoBlack : S.pianoWhite),
+                              ...(isActive ? S.pianoKeyActive : {}),
+                            }}>
+                              <span style={S.pianoKeyLabel}>{k}</span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* AI Harmony */}
+                <div style={S.row}>
+                  <span style={S.label}>
+                    AI HARMONY <span style={{color:'rgba(167,139,250,0.6)', fontSize: 8}}>powered by Claude</span>
+                    <button onClick={() => setShowApiKey(s => !s)} style={{
+                      ...S.chipKey, marginLeft: 6, cursor: "pointer", background: "none", border: "none",
+                      color: apiKey ? "rgba(100,255,218,0.5)" : "rgba(255,255,255,0.3)", fontSize: 10,
+                    }}>🔑</button>
+                  </span>
+                  {showApiKey && (
+                    <input
+                      style={{...S.aiInput, marginBottom: 4}}
+                      type="password"
+                      placeholder="Anthropic API key (sk-ant-...)"
+                      value={apiKey}
+                      onChange={e => setApiKey(e.target.value)}
+                    />
+                  )}
+                  <div style={S.aiRow}>
+                    <input
+                      style={S.aiInput}
+                      placeholder="describe a mood... (e.g. 'eerie underwater cave')"
+                      value={aiPrompt}
+                      onChange={e => setAiPrompt(e.target.value)}
+                      onKeyDown={e => e.key === "Enter" && askAI()}
+                    />
+                    <button onClick={askAI} disabled={aiLoading}
+                      style={{...S.chip, ...S.chipAI, opacity: aiLoading ? 0.5 : 1}}>
+                      {aiLoading ? "···" : "✦ Apply"}
+                    </button>
+                  </div>
+                  {aiStatus && <div style={S.aiStatus}>{aiStatus}</div>}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ─── Styles ─────────────────────────────────────────────────
+    const S = {
+      container: {
+        width: "100vw", height: "100vh",
+        background: "linear-gradient(170deg, #08080a 0%, #0c1018 40%, #0a0d14 100%)",
+        color: "#d0d0d0", fontFamily: "'IBM Plex Mono', monospace",
+        display: "flex", flexDirection: "column", overflow: "hidden", userSelect: "none",
+      },
+      header: {
+        display: "flex", justifyContent: "space-between", alignItems: "center",
+        padding: "10px 16px", borderBottom: "1px solid rgba(100,255,218,0.08)",
+        background: "rgba(0,0,0,0.3)",
+      },
+      titleRow: { display: "flex", alignItems: "baseline", gap: 8 },
+      title: {
+        fontFamily: "'Space Mono', monospace", fontSize: 15, fontWeight: 700,
+        color: "#64ffda", letterSpacing: 3, margin: 0,
+      },
+      badge: {
+        fontSize: 7, fontWeight: 700, letterSpacing: 3, color: "#0a0a0c",
+        background: "linear-gradient(135deg, #64ffda, #a78bfa)", padding: "2px 6px",
+        borderRadius: 3,
+      },
+      subtitle: { fontSize: 10, color: "rgba(255,255,255,0.3)", fontStyle: "italic" },
+      headerRight: { display: "flex", alignItems: "center", gap: 10 },
+      helpBtn: {
+        width: 22, height: 22, borderRadius: "50%", border: "1px solid rgba(255,255,255,0.15)",
+        background: "transparent", color: "rgba(255,255,255,0.4)", fontSize: 11,
+        cursor: "pointer", fontFamily: "'IBM Plex Mono', monospace",
+      },
+      credit: { fontSize: 9, color: "rgba(255,255,255,0.2)", letterSpacing: 1 },
+      helpOverlay: {
+        position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", zIndex: 100,
+        display: "flex", alignItems: "center", justifyContent: "center",
+      },
+      helpBox: {
+        background: "#12141a", border: "1px solid rgba(100,255,218,0.15)",
+        borderRadius: 8, padding: 24, maxWidth: 420,
+        fontFamily: "'IBM Plex Mono', monospace",
+      },
+      helpTitle: { fontSize: 11, fontWeight: 600, color: "#64ffda", letterSpacing: 2, marginTop: 12, marginBottom: 4 },
+      helpText: { fontSize: 11, lineHeight: 1.6, color: "rgba(255,255,255,0.6)" },
+      startOverlay: {
+        flex: 1, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer",
+      },
+      startContent: {
+        textAlign: "center", padding: "40px 48px",
+        border: "1px solid rgba(100,255,218,0.15)", borderRadius: 12,
+        background: "rgba(100,255,218,0.02)",
+      },
+      startIcon: { fontSize: 40, color: "#64ffda", marginBottom: 12 },
+      startText: { fontSize: 15, fontWeight: 500, color: "#64ffda", marginBottom: 6 },
+      startHint: { fontSize: 10, color: "rgba(255,255,255,0.3)", letterSpacing: 1 },
+      mainLayout: { flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" },
+      gridWrapper: { flex: 1, padding: "6px 12px", minHeight: 0 },
+      grid: {
+        width: "100%", height: "100%", position: "relative",
+        border: "1px solid rgba(100,255,218,0.1)", borderRadius: 6,
+        background: "radial-gradient(ellipse at 50% 50%, rgba(100,255,218,0.02) 0%, transparent 70%)",
+        cursor: "crosshair", overflow: "hidden", touchAction: "none",
+      },
+      canvas: { position: "absolute", top: 0, left: 0, width: "100%", height: "100%", pointerEvents: "none" },
+      gridHint: {
+        position: "absolute", top: "50%", left: "50%", transform: "translate(-50%,-50%)",
+        fontSize: 12, color: "rgba(255,255,255,0.15)", pointerEvents: "none", textAlign: "center",
+      },
+      axLabelX: {
+        position: "absolute", bottom: 3, left: "50%", transform: "translateX(-50%)",
+        fontSize: 8, color: "rgba(100,255,218,0.2)", letterSpacing: 2, pointerEvents: "none",
+      },
+      axLabelY: {
+        position: "absolute", left: 3, top: "50%", transform: "translateY(-50%) rotate(-90deg)",
+        fontSize: 8, color: "rgba(255,107,107,0.2)", letterSpacing: 2, pointerEvents: "none",
+        whiteSpace: "nowrap",
+      },
+      controls: {
+        padding: "6px 12px 10px", borderTop: "1px solid rgba(100,255,218,0.08)",
+        display: "flex", flexDirection: "column", gap: 5, background: "rgba(0,0,0,0.4)",
+        maxHeight: "45vh", overflowY: "auto",
+      },
+      voiceRow: { display: "flex", gap: 4, flexWrap: "wrap" },
+      voiceTag: {
+        fontSize: 11, fontWeight: 600, fontFamily: "'Space Mono', monospace",
+        padding: "1px 6px", border: "1px solid rgba(100,255,218,0.3)", borderRadius: 3,
+        color: "#fff", background: "rgba(255,255,255,0.03)",
+      },
+      row: { display: "flex", flexDirection: "column", gap: 3 },
+      splitRow: { display: "flex", gap: 10 },
+      halfCol: { flex: 1, display: "flex", flexDirection: "column", gap: 3 },
+      label: {
+        fontSize: 8, fontWeight: 600, color: "rgba(255,255,255,0.3)",
+        letterSpacing: 2, textTransform: "uppercase",
+      },
+      chipRow: { display: "flex", flexWrap: "wrap", gap: 3, alignItems: "center" },
+      chip: {
+        background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.08)",
+        borderRadius: 4, padding: "2px 7px", color: "rgba(255,255,255,0.45)",
+        fontSize: 10, fontFamily: "'IBM Plex Mono', monospace", cursor: "pointer",
+        transition: "all 0.12s", outline: "none", whiteSpace: "nowrap",
+      },
+      chipActive: {
+        background: "rgba(100,255,218,0.1)", borderColor: "rgba(100,255,218,0.35)",
+        color: "#64ffda",
+      },
+      chipRec: {
+        background: "rgba(255,60,60,0.15)", borderColor: "rgba(255,60,60,0.4)",
+        color: "#ff6b6b",
+      },
+      chipPiano: {
+        background: "rgba(167,139,250,0.12)", borderColor: "rgba(167,139,250,0.4)",
+        color: "#a78bfa",
+      },
+      chipAI: {
+        background: "rgba(167,139,250,0.1)", borderColor: "rgba(167,139,250,0.3)",
+        color: "#a78bfa",
+      },
+      chipKey: { fontSize: 7, opacity: 0.4, marginRight: 2 },
+      meterOuter: {
+        flex: 1, height: 20, background: "rgba(255,255,255,0.03)",
+        border: "1px solid rgba(255,255,255,0.08)", borderRadius: 3, overflow: "hidden",
+        position: "relative",
+      },
+      meterInner: {
+        height: "100%", background: "linear-gradient(90deg, rgba(100,255,218,0.1), rgba(100,255,218,0.25))",
+        transition: "width 0.15s",
+      },
+      loopDot: {
+        fontSize: 9, padding: "2px 6px", borderRadius: 3, color: "#fff", fontWeight: 600,
+      },
+      aiRow: { display: "flex", gap: 4 },
+      aiInput: {
+        flex: 1, background: "rgba(255,255,255,0.03)", border: "1px solid rgba(167,139,250,0.15)",
+        borderRadius: 4, padding: "4px 8px", color: "#d0d0d0", fontSize: 10,
+        fontFamily: "'IBM Plex Mono', monospace", outline: "none",
+      },
+      aiStatus: {
+        fontSize: 9, color: "rgba(167,139,250,0.6)", fontStyle: "italic", marginTop: 1,
+      },
+      pianoSection: {
+        display: "flex", flexDirection: "column", gap: 4,
+        padding: "6px 0",
+        borderTop: "1px solid rgba(167,139,250,0.1)",
+      },
+      pianoRows: { display: "flex", flexDirection: "column", gap: 3 },
+      pianoRow: { display: "flex", gap: 2, alignItems: "center" },
+      pianoRowLabel: {
+        fontSize: 7, color: "rgba(255,255,255,0.2)", width: 32, textAlign: "right",
+        marginRight: 4, letterSpacing: 1, flexShrink: 0,
+      },
+      pianoKey: {
+        width: 28, height: 28, borderRadius: 3, display: "flex",
+        alignItems: "center", justifyContent: "center",
+        transition: "all 0.08s", cursor: "pointer", flexShrink: 0,
+      },
+      pianoWhite: {
+        background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)",
+      },
+      pianoBlack: {
+        background: "rgba(167,139,250,0.1)", border: "1px solid rgba(167,139,250,0.2)",
+      },
+      pianoKeyActive: {
+        background: "rgba(167,139,250,0.4)", borderColor: "rgba(167,139,250,0.7)",
+        boxShadow: "0 0 12px rgba(167,139,250,0.3)",
+      },
+      pianoKeyLabel: {
+        fontSize: 9, fontWeight: 600, color: "rgba(255,255,255,0.5)",
+        fontFamily: "'IBM Plex Mono', monospace",
+      },
+    };
+
+    // ─── Mount ──────────────────────────────────────────────────
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<MusicMouseFuture />);
+  </script>
+</body>
+</html>
